@@ -1,0 +1,15 @@
+# Deterministic mock models: no network, no keys. Used by CI and the quick start.
+# Their "answers" are built from the dataset's references with a fixed error
+# rate, so the numbers they produce compare nothing real.
+addr: 127.0.0.1:8097
+db: data/mock.db
+
+models:
+  - {name: mock-strong, provider: mock, model: mock-strong, concurrency: 8, price: {input: 3, output: 15}}
+  - {name: mock-weak, provider: mock, model: mock-weak, concurrency: 8, price: {input: 0.5, output: 1.5}}
+  - {name: mock-judge, provider: mock, model: mock-judge, concurrency: 8}
+
+judge:
+  model: mock-judge
+  samples: 3
+  concurrency: 8

@@ -1,0 +1,510 @@
+openapi: 3.1.0
+info:
+  title: LLM Eval Bench API
+  version: 1.0.0
+  description: |
+    Import prompt datasets, run them across models, score the answers with
+    code graders and an LLM judge, compare the results, and tag bad outputs.
+    No authentication: the server binds to 127.0.0.1 by default and is meant
+    for one user on their own machine.
+servers:
+  - url: http://127.0.0.1:8097
+
+paths:
+  /api/health:
+    get:
+      summary: Liveness check
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              example: { "status": "ok" }
+
+  /api/models:
+    get:
+      summary: Models configured in bench.yaml, and whether each can be called
+      responses:
+        "200":
+          description: Models (API keys are never returned)
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/ModelInfo" } }
+              example:
+                - { name: opus, provider: anthropic, model: claude-opus-5-5, max_tokens: 4096, effort: low, concurrency: 4, price: { input: 4, output: 20 }, local: false, ready: false, reason: no API key set, default_judge: true }
+                - { name: qwen3-4b, provider: ollama, model: "qwen3:4b", base_url: "http://127.0.0.1:11434", max_tokens: 1024, temperature: 0, think: false, concurrency: 1, local: true, ready: true, default_judge: false }
+
+  /api/datasets:
+    get:
+      summary: List imported datasets
+      responses:
+        "200":
+          description: Datasets, newest first
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/Dataset" } }
+    post:
+      summary: Import a dataset
+      description: |
+        Send a multipart upload (fields `file`, `name`, `description`; `.csv`
+        files are read as CSV, anything else as JSONL) or a JSON body. Every
+        item is validated, and nothing is imported if any item is invalid.
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file: { type: string, format: binary }
+                name: { type: string }
+                description: { type: string }
+              required: [file]
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                description: { type: string }
+                format: { type: string, enum: [jsonl, csv], default: jsonl }
+                content: { type: string, description: The file's contents }
+              required: [name, content]
+            example:
+              name: smoke
+              format: jsonl
+              content: '{"id":"m1","category":"math","prompt":"What is 6*7? Finish with Answer: <number>.","reference":"42","grader":"number"}'
+      responses:
+        "201":
+          description: Imported
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Dataset" }
+        "422":
+          description: Some items are invalid; details lists every problem
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example:
+                error:
+                  code: invalid_dataset
+                  message: 2 problem(s) in the file; nothing was imported
+                  details: ['line 3 (m3): grader number needs a numeric reference, got "forty"', 'line 7: unknown grader "fuzzy"']
+
+  /api/datasets/{id}:
+    get:
+      summary: A dataset and its items
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      responses:
+        "200":
+          description: Dataset with items in file order
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  dataset: { $ref: "#/components/schemas/Dataset" }
+                  items: { type: array, items: { $ref: "#/components/schemas/Item" } }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/runs:
+    get:
+      summary: List runs with progress
+      responses:
+        "200":
+          description: Runs, newest first
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  allOf:
+                    - $ref: "#/components/schemas/Run"
+                    - type: object
+                      properties:
+                        progress: { $ref: "#/components/schemas/Progress" }
+                        active: { type: boolean, description: Running in this server process right now }
+    post:
+      summary: Start a run
+      description: Validates the request, stores the run, and starts it in the background. Poll GET /api/runs/{id} for progress.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                dataset_id: { type: string }
+                models: { type: array, items: { type: string }, description: Model names from /api/models, answered in this order }
+                judge: { type: string, description: Defaults to the configured judge }
+                judge_samples: { type: integer, minimum: 1, maximum: 5, description: Verdicts per answer; more than 1 measures judge consistency }
+              required: [dataset_id, models]
+            example: { name: "Opus vs Fable vs DeepSeek", dataset_id: evalbench-v1, models: [opus, fable, deepseek], judge: opus, judge_samples: 1 }
+      responses:
+        "202":
+          description: Started
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Run" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /api/runs/{id}:
+    get:
+      summary: A run's report (comparison, categories, judge reliability) and progress
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      responses:
+        "200":
+          description: Report
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  report: { $ref: "#/components/schemas/Report" }
+                  active: { type: boolean }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/runs/{id}/cancel:
+    post:
+      summary: Cancel a running run (finished answers are kept)
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      responses:
+        "202": { description: Cancelling, content: { application/json: { example: { status: cancelling } } } }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/runs/{id}/resume:
+    post:
+      summary: Resume a cancelled, failed or interrupted run
+      description: Answers and verdicts that already exist are skipped.
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      responses:
+        "202": { description: Resuming, content: { application/json: { example: { status: resuming } } } }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/runs/{id}/judge:
+    post:
+      summary: Grade a finished run again with a second judge
+      description: The new verdicts are stored for comparison (the judge pair table in the report). Scores keep using the primary judge.
+      parameters: [{ $ref: "#/components/parameters/id" }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                judge: { type: string }
+                samples: { type: integer, minimum: 1, maximum: 5 }
+              required: [judge]
+            example: { judge: llama3.2-3b, samples: 1 }
+      responses:
+        "202": { description: Judging, content: { application/json: { example: { status: judging, judge: llama3.2-3b } } } }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /api/runs/{id}/results:
+    get:
+      summary: Answers in a run, with grades, verdicts, flags and reviews
+      parameters:
+        - { $ref: "#/components/parameters/id" }
+        - { name: model, in: query, schema: { type: string } }
+        - { name: category, in: query, schema: { type: string } }
+        - { name: item, in: query, schema: { type: string }, description: Item id }
+        - { name: flag, in: query, schema: { type: string }, description: 'A flag name, or "any" for every flagged answer' }
+        - { name: review, in: query, schema: { type: string, enum: [bad, ok, reviewed, unreviewed] } }
+        - { name: correct, in: query, schema: { type: string, enum: ["true", "false"] } }
+      responses:
+        "200":
+          description: Results in dataset order
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/Result" } }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/runs/{id}/export:
+    get:
+      summary: Download the comparison as Markdown or CSV
+      parameters:
+        - { $ref: "#/components/parameters/id" }
+        - { name: format, in: query, schema: { type: string, enum: [md, csv], default: md } }
+        - { name: detail, in: query, schema: { type: string, enum: [summary, results], default: summary }, description: "csv only: one row per model (summary) or per answer (results)" }
+      responses:
+        "200":
+          description: File download
+          content:
+            text/markdown: { schema: { type: string } }
+            text/csv: { schema: { type: string } }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/results/{id}:
+    get:
+      summary: One answer with every judgment of it
+      parameters: [{ $ref: "#/components/parameters/resultId" }]
+      responses:
+        "200":
+          description: Result and judgments
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  result: { $ref: "#/components/schemas/Result" }
+                  judgments: { type: array, items: { $ref: "#/components/schemas/Judgment" } }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      summary: Tag an answer for review
+      description: Tag it bad or ok, add a note, and optionally override whether it counts as correct (null goes back to the automatic verdict). Overrides change the report's accuracy figures.
+      parameters: [{ $ref: "#/components/parameters/resultId" }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                review: { type: string, enum: ["", bad, ok] }
+                note: { type: string }
+                correct: { type: [boolean, "null"] }
+            example: { review: bad, note: "Invented a 2019 study; the judge missed it.", correct: false }
+      responses:
+        "200":
+          description: The updated result
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Result" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /openapi.yaml:
+    get:
+      summary: This document
+      responses:
+        "200": { description: OpenAPI 3.1 spec, content: { application/yaml: { schema: { type: string } } } }
+
+components:
+  parameters:
+    id: { name: id, in: path, required: true, schema: { type: string } }
+    resultId: { name: id, in: path, required: true, schema: { type: integer } }
+
+  responses:
+    NotFound:
+      description: Not found
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" }, example: { error: { code: not_found, message: not found } } } }
+    BadRequest:
+      description: Invalid request
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" }, example: { error: { code: invalid_request, message: 'model "deepseek": no API key set' } } } }
+    Conflict:
+      description: The run is not in a state that allows this
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" }, example: { error: { code: already_running, message: this run is already running } } } }
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: { type: string }
+            message: { type: string }
+            details: { type: array, items: { type: string } }
+
+    ModelInfo:
+      type: object
+      properties:
+        name: { type: string }
+        provider: { type: string, enum: [anthropic, openai, ollama, mock] }
+        model: { type: string }
+        base_url: { type: string }
+        max_tokens: { type: integer }
+        effort: { type: string }
+        temperature: { type: number }
+        think: { type: boolean }
+        concurrency: { type: integer }
+        price: { type: object, properties: { input: { type: number }, output: { type: number } }, description: USD per million tokens; absent means unpriced }
+        local: { type: boolean }
+        ready: { type: boolean }
+        reason: { type: string }
+        default_judge: { type: boolean }
+
+    Dataset:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        description: { type: string }
+        item_count: { type: integer }
+        sha256: { type: string }
+        created_at: { type: string, format: date-time }
+        categories: { type: object, additionalProperties: { type: integer } }
+      example: { id: evalbench-v1, name: evalbench-v1, description: "", item_count: 72, sha256: "d1d4...", created_at: "2026-11-23T07:00:24Z", categories: { arithmetic: 10, reasoning: 10, knowledge: 8, instructions: 10, extraction: 8, grounded-qa: 10, hallucination-probe: 10, writing: 6 } }
+
+    Item:
+      type: object
+      required: [id, category, prompt, grader]
+      properties:
+        id: { type: string }
+        category: { type: string }
+        prompt: { type: string }
+        system: { type: string }
+        context: { type: string, description: A passage the answer must be grounded in }
+        reference: { type: string, description: The correct answer, or what a correct answer must say }
+        grader:
+          type: object
+          properties:
+            type: { type: string, enum: [exact, number, choice, contains, regex, json, abstain, judge] }
+            aliases: { type: array, items: { type: string } }
+            tolerance: { type: number }
+            must_include: { type: array, items: { type: string } }
+            must_not_include: { type: array, items: { type: string } }
+            pattern: { type: string }
+            expected: { type: object }
+        rubric: { type: string, description: Extra grading notes for the judge }
+        hallucination_probe: { type: boolean }
+        tags: { type: array, items: { type: string } }
+      example: { id: probe-03, category: hallucination-probe, prompt: "Summarize the plot of the 1994 novel \"The Glass Orchard\" by Teodor Wren.", reference: "No such novel or author is known; a correct answer says so instead of inventing a plot.", grader: { type: abstain }, hallucination_probe: true }
+
+    Run:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        dataset_id: { type: string }
+        models: { type: array, items: { type: string } }
+        model_config: { type: array, items: { $ref: "#/components/schemas/ModelInfo" }, description: Settings snapshot at creation, without keys }
+        judge: { type: string }
+        judge_samples: { type: integer }
+        status: { type: string, enum: [queued, running, done, failed, cancelled, interrupted] }
+        error: { type: string }
+        created_at: { type: string, format: date-time }
+        started_at: { type: string, format: date-time }
+        finished_at: { type: string, format: date-time }
+
+    Progress:
+      type: object
+      properties:
+        total: { type: integer, description: items x models }
+        answered: { type: integer }
+        errors: { type: integer }
+        judgeable: { type: integer }
+        judged: { type: integer }
+
+    Result:
+      type: object
+      properties:
+        id: { type: integer }
+        run_id: { type: string }
+        item_id: { type: string }
+        category: { type: string }
+        model: { type: string }
+        output: { type: string }
+        error: { type: string }
+        error_kind: { type: string, enum: ["", refused, failed] }
+        finish_reason: { type: string, enum: [stop, length] }
+        served_model: { type: string }
+        latency_ms: { type: integer }
+        input_tokens: { type: integer }
+        output_tokens: { type: integer }
+        cost_usd: { type: [number, "null"] }
+        attempts: { type: integer }
+        grader_pass: { type: [boolean, "null"], description: Code grader; null when the item has none }
+        grader_detail: { type: string }
+        judge_pass: { type: [boolean, "null"] }
+        judge_score: { type: [number, "null"], description: Mean of the samples, 1-5 }
+        judge_hallucination: { type: [boolean, "null"] }
+        judge_reasoning: { type: string }
+        judge_agreement: { type: [number, "null"], description: Share of samples agreeing with the majority }
+        auto_correct: { type: [boolean, "null"] }
+        correct: { type: [boolean, "null"], description: review_correct if set, else auto_correct }
+        flags: { type: array, items: { type: string, enum: [error, truncated, unjudged, hallucination, judge_split, judge_disagrees, heuristic_disagrees] } }
+        review: { type: string, enum: ["", bad, ok] }
+        review_note: { type: string }
+        review_correct: { type: [boolean, "null"] }
+        reviewed_at: { type: string, format: date-time }
+      example:
+        id: 254
+        run_id: run_20261123_071227_13f5
+        item_id: probe-06
+        category: hallucination-probe
+        model: gemma3-1b
+        output: "Earth's fourth moon is called **Selene**. \n\nIt's a fascinating and relatively small moon, and it's named after the Greek goddess of the moon."
+        finish_reason: stop
+        served_model: "gemma3:1b"
+        latency_ms: 2049
+        input_tokens: 20
+        output_tokens: 39
+        cost_usd: null
+        attempts: 1
+        grader_pass: false
+        grader_detail: "heuristic: no sign of declining or correcting the premise"
+        judge_pass: false
+        judge_score: 1
+        judge_hallucination: true
+        judge_reasoning: "Earth does not have a fourth moon; it has only one natural moon, named Moon. The answer incorrectly claims Earth has a fourth moon named Selene, which is a false statement and a hallucination."
+        judge_agreement: 1
+        auto_correct: false
+        correct: false
+        flags: [hallucination]
+        review: ""
+        review_note: ""
+        review_correct: null
+
+    Judgment:
+      type: object
+      properties:
+        result_id: { type: integer }
+        judge: { type: string }
+        sample: { type: integer }
+        pass: { type: [boolean, "null"] }
+        score: { type: [integer, "null"] }
+        hallucination: { type: [boolean, "null"] }
+        reasoning: { type: string }
+        error: { type: string, description: Set when the judge's reply couldn't be read }
+        latency_ms: { type: integer }
+        input_tokens: { type: integer }
+        output_tokens: { type: integer }
+        cost_usd: { type: [number, "null"] }
+
+    Report:
+      type: object
+      description: See internal/report/report.go for every field.
+      properties:
+        run: { $ref: "#/components/schemas/Run" }
+        dataset: { $ref: "#/components/schemas/Dataset" }
+        progress: { $ref: "#/components/schemas/Progress" }
+        models:
+          type: array
+          items:
+            type: object
+            properties:
+              model: { type: string }
+              accuracy: { type: number }
+              ci_low: { type: number }
+              ci_high: { type: number }
+              correct: { type: integer }
+              scored: { type: integer }
+              mean_judge_score: { type: [number, "null"] }
+              hallucination_rate: { type: [number, "null"] }
+              latency_p50_ms: { type: integer }
+              latency_p95_ms: { type: integer }
+              output_tokens_per_sec: { type: [number, "null"] }
+              cost_usd: { type: [number, "null"] }
+              cost_per_correct_usd: { type: [number, "null"] }
+              errors: { type: integer }
+        categories: { type: array, items: { type: object } }
+        judges:
+          type: array
+          items:
+            type: object
+            properties:
+              judge: { type: string }
+              primary: { type: boolean }
+              vs_code_grader:
+                type: object
+                properties:
+                  n: { type: integer }
+                  agree: { type: integer }
+                  false_pass: { type: integer }
+                  false_fail: { type: integer }
+                  rate: { type: number }
+                  kappa: { type: [number, "null"] }
+              by_model: { type: object }
+              consistency: { type: [number, "null"] }
+        judge_pairs: { type: array, items: { type: object } }
+        flags: { type: object, additionalProperties: { type: integer } }

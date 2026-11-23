@@ -1,0 +1,38 @@
+# The setup behind the results in the README: three small open models on an
+# Apple M1 (16 GB) through Ollama, no API keys.
+#   ollama pull qwen3:4b-instruct && ollama pull llama3.2:3b && ollama pull gemma3:1b
+addr: 127.0.0.1:8097
+db: data/local.db
+
+models:
+  - name: qwen3-4b
+    provider: ollama
+    # The instruct variant. The default qwen3:4b tag is the thinking variant,
+    # which kept reasoning even with think: false (578 output tokens and 60 s
+    # per answer on average in a 16-item trial).
+    model: qwen3:4b-instruct
+    temperature: 0
+    max_tokens: 1024
+    local: true
+
+  - name: llama3.2-3b
+    provider: ollama
+    model: llama3.2:3b
+    temperature: 0
+    max_tokens: 1024
+    local: true
+
+  - name: gemma3-1b
+    provider: ollama
+    model: gemma3:1b
+    temperature: 0
+    max_tokens: 1024
+    local: true
+
+judge:
+  model: qwen3-4b       # the strongest of the three; it also grades its own answers
+  samples: 1
+  # One request at a time. Serving three in parallel (OLLAMA_NUM_PARALLEL=3)
+  # grew Ollama's memory to 4.5 GB on this 16 GB machine and generation fell
+  # from about 15 to 1.6 tokens/s, so parallel judging was slower, not faster.
+  concurrency: 1

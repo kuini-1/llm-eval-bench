@@ -1,0 +1,46 @@
+# Copy to bench.yaml and set the keys in your environment (see .env.example).
+# ${VAR} references are expanded when the file is loaded, so keys never live here.
+addr: 127.0.0.1:8097
+db: data/evalbench.db
+
+models:
+  - name: opus
+    provider: anthropic
+    model: claude-opus-5-5
+    api_key: ${ANTHROPIC_API_KEY}
+    effort: low            # thinking is always on for this model; effort sets how much
+    max_tokens: 4096       # covers thinking plus the answer
+    concurrency: 4
+    price: {input: 4, output: 20}       # USD per million tokens, list price as of November 2026
+
+  - name: fable
+    provider: anthropic
+    model: claude-fable-5-2
+    api_key: ${ANTHROPIC_API_KEY}
+    effort: low
+    max_tokens: 4096
+    concurrency: 4
+    price: {input: 8, output: 40}
+
+  - name: deepseek
+    provider: openai       # DeepSeek speaks the OpenAI chat completions format
+    base_url: https://api.deepseek.com
+    model: deepseek-chat
+    api_key: ${DEEPSEEK_API_KEY}
+    temperature: 0
+    max_tokens: 1024
+    concurrency: 4
+    # price: {input: ..., output: ...}  # set from DeepSeek's pricing page; without it cost shows as n/a
+
+  # Local models through Ollama (see bench/local.yaml for the setup used in the README):
+  # - name: llama3.2-3b
+  #   provider: ollama
+  #   model: llama3.2:3b
+  #   temperature: 0
+  #   local: true
+
+judge:
+  model: opus              # any model above; a judge that is also a candidate grades its own answers
+  samples: 1               # 2 or more: majority vote, and the report measures judge consistency
+  sample_temperature: 0.8  # for samples after the first (ignored by Claude)
+  concurrency: 4
