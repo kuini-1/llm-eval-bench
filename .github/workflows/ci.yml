@@ -1,0 +1,56 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: test -z "$(gofmt -l .)"
+      - run: go test -race ./...
+      - name: Dataset generator reproduces the committed file
+        run: |
+          python3 datasets/make_evalbench_v1.py
+          git diff --exit-code datasets/evalbench-v1.jsonl
+      - name: Mock benchmark end to end
+        run: |
+          make demo | tee demo.md
+          grep -q "## How far to trust the judge" demo.md
+          grep -q "| mock-strong |" demo.md
+
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run build
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: docker build -t evalbench-api .
+      - run: docker build -t evalbench-web web
+      - name: API container serves the spec
+        run: |
+          docker run -d --name api -p 8097:8097 evalbench-api
+          for i in $(seq 1 20); do curl -sf localhost:8097/api/health && break; sleep 1; done
+          curl -sf localhost:8097/openapi.yaml | head -3
+          curl -sf localhost:8097/api/models | grep -q mock-judge

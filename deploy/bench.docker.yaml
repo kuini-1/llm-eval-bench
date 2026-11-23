@@ -1,0 +1,46 @@
+# Default config inside the API container. Mount your own at
+# /etc/evalbench/bench.yaml to change it. Keys come from the environment.
+addr: 0.0.0.0:8097
+db: /data/evalbench.db
+
+models:
+  - name: opus
+    provider: anthropic
+    model: claude-opus-5-5
+    api_key: ${ANTHROPIC_API_KEY}
+    effort: low
+    max_tokens: 4096
+    price: {input: 4, output: 20}
+
+  - name: fable
+    provider: anthropic
+    model: claude-fable-5-2
+    api_key: ${ANTHROPIC_API_KEY}
+    effort: low
+    max_tokens: 4096
+    price: {input: 8, output: 40}
+
+  - name: deepseek
+    provider: openai
+    base_url: https://api.deepseek.com
+    model: deepseek-chat
+    api_key: ${DEEPSEEK_API_KEY}
+    temperature: 0
+
+  # Ollama running on the host machine.
+  - name: llama3.2-3b
+    provider: ollama
+    base_url: http://host.docker.internal:11434
+    model: llama3.2:3b
+    temperature: 0
+    local: true
+
+  # No-network mocks, so the UI can be tried without keys.
+  - {name: mock-strong, provider: mock, model: mock-strong, concurrency: 8}
+  - {name: mock-weak, provider: mock, model: mock-weak, concurrency: 8}
+  - {name: mock-judge, provider: mock, model: mock-judge, concurrency: 8}
+
+judge:
+  model: mock-judge   # switch to opus once ANTHROPIC_API_KEY is set
+  samples: 1
+  concurrency: 4

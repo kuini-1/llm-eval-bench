@@ -1,0 +1,28 @@
+# docker compose up --build
+# Then open http://localhost:3007. Without keys, the mock models are available;
+# put ANTHROPIC_API_KEY / DEEPSEEK_API_KEY in .env to add the real ones.
+services:
+  api:
+    build: .
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # reach Ollama on the host
+    ports:
+      - "127.0.0.1:8097:8097"
+
+  web:
+    build:
+      context: ./web
+      args:
+        EVALBENCH_API_URL: http://api:8097
+    ports:
+      - "127.0.0.1:3007:3000"
+    depends_on:
+      - api
+
+volumes:
+  data:

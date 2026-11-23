@@ -1,0 +1,18 @@
+# The API image needs go.mod/go.sum, cmd/, internal/, assets/, datasets/ and deploy/.
+# The web UI is built from web/ with its own ignore file.
+.git
+.github
+bin
+data
+docs
+web
+bench/results
+*.db
+*.db-wal
+*.db-shm
+.DS_Store
+
+# Local config and secrets never go into an image.
+bench.yaml
+.env
+.env.*
